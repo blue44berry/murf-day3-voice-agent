@@ -1,4 +1,8 @@
 import logging
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -6,132 +10,285 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
-    metrics,
-    tokenize,
-    # function_tool,
-    # RunContext
+    function_tool,
+    RunContext,
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import murf, deepgram, google, silero, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+logger = logging.getLogger("tutor-agent")
 
 load_dotenv(".env.local")
 
 
-class Assistant(Agent):
-    def __init__(self) -> None:
+# ---------- Shared session state ----------
+
+@dataclass
+class TutorUserData:
+    """State shared across all tutor agents in the session."""
+    personas: Dict[str, Agent] = field(default_factory=dict)
+    tutor_content: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def load_tutor_content() -> List[Dict[str, Any]]:
+    """
+    Load concepts from shared-data/day4_tutor_content.json.
+    If the file is missing, fall back to a small built-in sample so it still runs.
+    """
+    content_path = Path(__file__).parent.parent / "shared-data" / "day4_tutor_content.json"
+
+    if not content_path.exists():
+        logger.warning("Tutor content file not found at %s, using fallback sample.", content_path)
+        return [
+            {
+                "id": "variables",
+                "title": "Variables",
+                "summary": "Variables store values so you can reuse them later in your code.",
+                "sample_question": "What is a variable and why is it useful?",
+            },
+            {
+                "id": "loops",
+                "title": "Loops",
+                "summary": "Loops let you repeat an action multiple times without copy-pasting code.",
+                "sample_question": "Explain the difference between a for loop and a while loop.",
+            },
+        ]
+
+    with content_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def format_concepts_for_prompt(concepts: List[Dict[str, Any]]) -> str:
+    """
+    Turn JSON concepts into a readable bullet list for the LLM prompt.
+    Only uses id, title, summary & sample_question.
+    """
+    lines: List[str] = []
+    for c in concepts:
+        cid = c.get("id", "")
+        title = c.get("title", "")
+        summary = c.get("summary", "")
+        sample_q = c.get("sample_question", "")
+        lines.append(
+            f"- id: {cid}\n"
+            f"  title: {title}\n"
+            f"  summary: {summary}\n"
+            f"  sample_question: {sample_q}\n"
+        )
+    return "\n".join(lines)
+
+
+# ---------- Base agent with handoff helper ----------
+
+class BaseTutorAgent(Agent):
+    def __init__(self, *, instructions: str, tts: murf.TTS) -> None:
+        super().__init__(instructions=instructions, tts=tts)
+
+    async def on_enter(self) -> None:
+        # Whenever this agent becomes active, it should talk to the user
+        await self.session.generate_reply()
+
+    async def _transfer_to_agent(self, name: str, context: RunContext) -> Agent:
+        """Return another agent instance by key from shared userdata.personas."""
+        userdata: TutorUserData = context.userdata
+        next_agent = userdata.personas.get(name)
+        if not next_agent:
+            # Just in case config is wrong
+            await self.session.say("Sorry, I couldn't switch modes properly. Please try again.")
+            return self
+        return next_agent
+
+
+# ---------- LEARN mode agent (Murf Falcon: Matthew) ----------
+
+class LearnAgent(BaseTutorAgent):
+    def __init__(self, tutor_content: List[Dict[str, Any]]) -> None:
+        concepts_block = format_concepts_for_prompt(tutor_content)
+
+        instructions = f"""
+You are the LEARN mode tutor in an Active Recall coaching system.
+
+You are helping the learner understand programming concepts using the content below.
+
+Available concepts (from JSON file):
+{concepts_block}
+
+Your behavior:
+- First, greet the learner.
+- Ask which learning mode they prefer: "learn", "quiz", or "teach_back".
+- If they clearly choose **quiz** or **teach_back**, call the appropriate tool to switch modes immediately.
+- If they choose **learn**, stay in this agent and proceed.
+
+While in LEARN mode:
+- Ask which concept they want to focus on (use the ids or titles).
+- Use that concept's summary to explain it in simple language with short, concrete examples.
+- Encourage questions and check for understanding.
+- If they ask to switch to another mode later, call the appropriate transfer tool.
+- Only use concepts that appear in the list above. Do NOT invent new concepts.
+"""
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
-            You are curious, friendly, and have a sense of humor.""",
+            instructions=instructions,
+            tts=murf.TTS(
+                voice="en-US-matthew",   # Murf Falcon Matthew
+                style="Conversation",
+            ),
         )
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+    @function_tool()
+    async def go_to_quiz_mode(self, context: RunContext) -> Agent:
+        """Switch to QUIZ mode when the learner wants to be quizzed."""
+        await self.session.say("Great, let's switch to quiz mode and test your understanding.")
+        return await self._transfer_to_agent("quiz", context)
 
+    @function_tool()
+    async def go_to_teach_back_mode(self, context: RunContext) -> Agent:
+        """Switch to TEACH-BACK mode when the learner wants to explain the concept themselves."""
+        await self.session.say("Awesome, let's switch to teach-back mode so you can explain it in your own words.")
+        return await self._transfer_to_agent("teach_back", context)
+
+
+# ---------- QUIZ mode agent (Murf Falcon: Alicia) ----------
+
+class QuizAgent(BaseTutorAgent):
+    def __init__(self, tutor_content: List[Dict[str, Any]]) -> None:
+        concepts_block = format_concepts_for_prompt(tutor_content)
+
+        instructions = f"""
+You are the QUIZ mode tutor in an Active Recall coaching system.
+
+Use the concepts and sample questions from the content below to quiz the learner.
+
+Concepts:
+{concepts_block}
+
+Behavior:
+- Ask the learner which concept they want to be quizzed on.
+- Use that concept's sample_question to start, then ask follow-up questions at a similar difficulty level.
+- Always wait for the learner's answer before giving feedback.
+- Give short, encouraging feedback: what they got right, and one thing to improve.
+- If they seem stuck, gently hint using the concept summary (not the exact text).
+
+Mode switching:
+- If they say they want to "learn" again, call go_to_learn_mode.
+- If they say they want to "teach back" or "explain it themselves", call go_to_teach_back_mode.
+"""
+        super().__init__(
+            instructions=instructions,
+            tts=murf.TTS(
+                voice="en-US-alicia",   # Murf Falcon Alicia
+                style="Conversation",
+            ),
+        )
+
+    @function_tool()
+    async def go_to_learn_mode(self, context: RunContext) -> Agent:
+        """Switch back to LEARN mode for more explanations."""
+        await self.session.say("No problem, let's go back to learning mode and review the concept together.")
+        return await self._transfer_to_agent("learn", context)
+
+    @function_tool()
+    async def go_to_teach_back_mode(self, context: RunContext) -> Agent:
+        """Switch to TEACH-BACK mode when the learner wants to explain the concept back."""
+        await self.session.say("Nice, let's move to teach-back mode so you can explain it to me.")
+        return await self._transfer_to_agent("teach_back", context)
+
+
+# ---------- TEACH-BACK mode agent (Murf Falcon: Ken) ----------
+
+class TeachBackAgent(BaseTutorAgent):
+    def __init__(self, tutor_content: List[Dict[str, Any]]) -> None:
+        concepts_block = format_concepts_for_prompt(tutor_content)
+
+        instructions = f"""
+You are the TEACH-BACK mode tutor in an Active Recall coaching system.
+
+Your job is to get the learner to explain concepts back to you in their own words,
+and then give short qualitative feedback.
+
+Content:
+{concepts_block}
+
+Behavior:
+- Ask which concept they'd like to teach back (variables, loops, etc.).
+- Ask them to explain it as if they are teaching a friend.
+- Listen to their explanation (you will receive it as text).
+- Compare it mentally to the summary for that concept and give brief feedback:
+  - What they did well.
+  - One or two missing or unclear points.
+- Encourage them and suggest if they should review or try a quiz next.
+
+Mode switching:
+- If they say they want to "learn" again, call go_to_learn_mode.
+- If they say they want to be "quizzed", call go_to_quiz_mode.
+"""
+        super().__init__(
+            instructions=instructions,
+            tts=murf.TTS(
+                voice="en-US-ken",   # Murf Falcon Ken
+                style="Conversation",
+            ),
+        )
+
+    @function_tool()
+    async def go_to_learn_mode(self, context: RunContext) -> Agent:
+        """Switch back to LEARN mode for more explanations."""
+        await self.session.say("Let's switch back to learn mode so we can review the concept again.")
+        return await self._transfer_to_agent("learn", context)
+
+    @function_tool()
+    async def go_to_quiz_mode(self, context: RunContext) -> Agent:
+        """Switch to QUIZ mode for follow-up questions."""
+        await self.session.say("Great, let's switch to quiz mode and test your understanding.")
+        return await self._transfer_to_agent("quiz", context)
+
+
+# ---------- Worker setup (same pattern as Day 3) ----------
 
 def prewarm(proc: JobProcess):
+    # Load VAD once and reuse across sessions
     proc.userdata["vad"] = silero.VAD.load()
 
 
 async def entrypoint(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
+    # Load content from JSON
+    tutor_content = load_tutor_content()
+
+    # Shared userdata across all tutor agents
+    userdata = TutorUserData(tutor_content=tutor_content)
+
+    # Create the three personas / modes
+    learn_agent = LearnAgent(tutor_content)
+    quiz_agent = QuizAgent(tutor_content)
+    teach_back_agent = TeachBackAgent(tutor_content)
+
+    userdata.personas = {
+        "learn": learn_agent,
+        "quiz": quiz_agent,
+        "teach_back": teach_back_agent,
     }
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
-    session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
+    # One shared AgentSession with STT + LLM
+    session = AgentSession[TutorUserData](
+        userdata=userdata,
         stt=deepgram.STT(model="nova-3"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=google.LLM(
-                model="gemini-2.5-flash",
-            ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=murf.TTS(
-                voice="en-US-matthew", 
-                style="Conversation",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
-            ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+        llm=google.LLM(model="gemini-2.5-flash"),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
-
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
+    # Start in LEARN agent, which will greet, ask for mode, and then switch if needed
     await session.start(
-        agent=Assistant(),
+        agent=learn_agent,
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            # For telephony applications, use `BVCTelephony` for best results
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
 
-    # Join the room and connect to the user
     await ctx.connect()
 
 

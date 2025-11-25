@@ -13,10 +13,18 @@ interface AppProps {
 export function App({ appConfig }: AppProps) {
   return (
     <SessionProvider appConfig={appConfig}>
-      <main className="grid h-svh grid-cols-1 place-content-center">
-        <ViewController />
+      {/* Make the main content hug the bottom */}
+      <main className="flex min-h-screen flex-col justify-end items-center pb-10">
+        <div className="w-full max-w-4xl">
+          <ViewController />
+        </div>
       </main>
-      <StartAudio label="Start Audio" />
+
+      {/* Fix the talk button at the bottom center */}
+      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-20">
+        <StartAudio label="Talk to our AI barista" />
+      </div>
+
       <RoomAudioRenderer />
       <Toaster />
     </SessionProvider>
